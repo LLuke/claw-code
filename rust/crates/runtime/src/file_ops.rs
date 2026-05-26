@@ -25,6 +25,20 @@ const GLOB_SEARCH_IGNORED_DIRS: &[&str] = &[
     "coverage",
 ];
 
+/// Returns true if any path component starts with '.' (hidden on Unix-like systems).
+///
+/// This check is applied to each component individually to avoid false positives
+/// from paths like "/some/dir/./file" where "." is a valid component.
+fn is_hidden_path(path: &Path) -> bool {
+    path.components().any(|component| {
+        if let std::path::Component::Normal(name) = component {
+            name.to_str().map_or(false, |s| s.starts_with('.'))
+        } else {
+            false
+        }
+    })
+}
+
 /// Check whether a file appears to contain binary content by examining
 /// the first chunk for NUL bytes.
 fn is_binary_file(path: &Path) -> io::Result<bool> {
@@ -347,9 +361,17 @@ fn glob_search_impl(
                 .unwrap_or_else(|_| walk_root.clone());
             validate_workspace_boundary(&canonical_walk_root, root)?;
         }
-        let entries = WalkDir::new(&walk_root)
-            .into_iter()
-            .filter_entry(|entry| !should_skip_glob_dir(entry));
+        let entries = WalkDir::new(&walk_root).into_iter().filter_entry(|entry| {
+            // Skip explicitly ignored directories
+            if should_skip_glob_dir(entry) {
+                return false;
+            }
+            // Skip hidden files/directories (components starting with '.')
+            if is_hidden_path(entry.path()) {
+                return false;
+            }
+            true
+        });
         for entry in entries.flatten() {
             let candidate = entry.path();
             if entry.file_type().is_file()
@@ -431,6 +453,11 @@ fn grep_search_impl(
     let mut total_matches = 0usize;
 
     for file_path in collect_search_files(&base_path)? {
+        // Skip hidden files/directories in grep search
+        if is_hidden_path(&file_path) {
+            continue;
+        }
+
         if let Some(root) = canonical_root.as_deref() {
             let canonical_file = file_path.canonicalize()?;
             validate_workspace_boundary(&canonical_file, root)?;
@@ -567,13 +594,21 @@ fn component_contains_glob(component: &str) -> bool {
 
 fn collect_search_files(base_path: &Path) -> io::Result<Vec<PathBuf>> {
     if base_path.is_file() {
+        // Also check if the file itself is hidden
+        if is_hidden_path(base_path) {
+            return Ok(vec![]);
+        }
         return Ok(vec![base_path.to_path_buf()]);
     }
 
     let mut files = Vec::new();
-    for entry in WalkDir::new(base_path) {
+    for entry in WalkDir::new(base_path)
+        .into_iter()
+        .filter_entry(|e| !is_hidden_path(e.path()))
+    // Prevent descending into hidden dirs
+    {
         let entry = entry.map_err(|error| io::Error::other(error.to_string()))?;
-        if entry.file_type().is_file() {
+        if entry.file_type().is_file() && !is_hidden_path(entry.path()) {
             files.push(entry.path().to_path_buf());
         }
     }
@@ -772,13 +807,13 @@ fn expand_braces(pattern: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use super::{
         component_contains_glob, derive_glob_walk_root, edit_file, expand_braces, glob_search,
-        grep_search, is_symlink_escape, read_file, read_file_in_workspace, write_file,
-        write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
+        grep_search, is_hidden_path, is_symlink_escape, read_file, read_file_in_workspace,
+        write_file, write_file_in_workspace, GrepSearchInput, MAX_WRITE_SIZE,
     };
 
     fn temp_path(name: &str) -> std::path::PathBuf {
@@ -1066,5 +1101,80 @@ mod tests {
         assert!(component_contains_glob("**"));
         assert!(component_contains_glob("*.rs"));
         assert!(!component_contains_glob("src"));
+    }
+
+    #[test]
+    fn is_hidden_path_detects_hidden_components() {
+        // Hidden file
+        assert!(is_hidden_path(Path::new(".git/config")));
+        assert!(is_hidden_path(Path::new(".env")));
+
+        // Hidden directory
+        assert!(is_hidden_path(Path::new("project/.git")));
+
+        // Non-hidden paths
+        assert!(!is_hidden_path(Path::new("/var/log/syslog")));
+
+        // Edge cases: "." and ".." are not considered hidden by this check
+        // because they are Component::CurDir/ParentDir, not Component::Normal
+        assert!(!is_hidden_path(Path::new("./file.txt")));
+        assert!(!is_hidden_path(Path::new("../parent/file.txt")));
+    }
+
+    #[test]
+    fn glob_search_skips_hidden_directories() {
+        let dir = temp_path("glob-hidden-test");
+        std::fs::create_dir_all(dir.join("visible")).unwrap();
+        std::fs::create_dir_all(dir.join(".hidden")).unwrap();
+
+        std::fs::write(dir.join("visible/file.txt"), "visible").unwrap();
+        std::fs::write(dir.join(".hidden/file.txt"), "hidden").unwrap();
+        std::fs::write(dir.join(".hiddenfile"), "also hidden").unwrap();
+
+        let result =
+            glob_search("**/*.txt", Some(dir.to_str().unwrap())).expect("glob should succeed");
+
+        assert_eq!(result.num_files, 1, "should only find visible file");
+        assert!(result
+            .filenames
+            .iter()
+            .any(|p| p.contains("visible/file.txt")));
+        assert!(!result.filenames.iter().any(|p| p.contains(".hidden")));
+        assert!(!result.filenames.iter().any(|p| p.contains(".hiddenfile")));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn grep_search_skips_hidden_files() {
+        let dir = temp_path("grep-hidden-test");
+        std::fs::create_dir_all(&dir).unwrap();
+
+        std::fs::write(dir.join("visible.rs"), "fn visible() {}").unwrap();
+        std::fs::write(dir.join(".hidden.rs"), "fn hidden() {}").unwrap();
+
+        let result = grep_search(&GrepSearchInput {
+            pattern: String::from("fn"),
+            path: Some(dir.to_string_lossy().into_owned()),
+            glob: None,
+            output_mode: Some(String::from("files_with_matches")),
+            before: None,
+            after: None,
+            context_short: None,
+            context: None,
+            line_numbers: None,
+            case_insensitive: None,
+            file_type: None,
+            head_limit: None,
+            offset: None,
+            multiline: None,
+        })
+        .expect("grep should succeed");
+
+        assert_eq!(result.num_files, 1, "should only match visible file");
+        assert!(result.filenames.iter().any(|p| p.contains("visible.rs")));
+        assert!(!result.filenames.iter().any(|p| p.contains(".hidden.rs")));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

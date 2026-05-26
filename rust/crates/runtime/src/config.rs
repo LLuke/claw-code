@@ -1056,6 +1056,10 @@ fn parse_optional_sandbox_config(root: &JsonValue) -> Result<SandboxConfig, Conf
         filesystem_mode,
         allowed_mounts: optional_string_array(sandbox, "allowedMounts", "merged settings.sandbox")?
             .unwrap_or_default(),
+        sandbox_home: optional_string(sandbox, "sandboxHome", "merged settings.sandbox")?
+            .map(str::to_string),
+        sandbox_tmp: optional_string(sandbox, "sandboxTmp", "merged settings.sandbox")?
+            .map(str::to_string),
     })
 }
 

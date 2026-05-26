@@ -71,10 +71,16 @@ pub struct BashCommandOutput {
 /// Executes a shell command with the requested sandbox settings.
 pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     let cwd = env::current_dir()?;
-    let sandbox_status = sandbox_status_for_input(&input, &cwd);
+    let (sandbox_status, sandbox_config) = sandbox_status_for_input(&input, &cwd);
 
     if input.run_in_background.unwrap_or(false) {
-        let mut child = prepare_command(&input.command, &cwd, &sandbox_status, false);
+        let mut child = prepare_command(
+            &input.command,
+            &cwd,
+            &sandbox_status,
+            &sandbox_config,
+            false,
+        );
         let child = child
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -101,7 +107,12 @@ pub fn execute_bash(input: BashCommandInput) -> io::Result<BashCommandOutput> {
     }
 
     let runtime = Builder::new_current_thread().enable_all().build()?;
-    runtime.block_on(execute_bash_async(input, sandbox_status, cwd))
+    runtime.block_on(execute_bash_async(
+        input,
+        sandbox_status,
+        sandbox_config,
+        cwd,
+    ))
 }
 
 /// Detect git push to main and emit ship provenance event
@@ -169,12 +180,14 @@ fn get_git_actor() -> Option<String> {
 async fn execute_bash_async(
     input: BashCommandInput,
     sandbox_status: SandboxStatus,
+    sandbox_config: SandboxConfig,
     cwd: std::path::PathBuf,
 ) -> io::Result<BashCommandOutput> {
     // Detect and emit ship provenance for git push operations
     detect_and_emit_ship_prepared(&input.command);
 
-    let mut command = prepare_tokio_command(&input.command, &cwd, &sandbox_status, true);
+    let mut command =
+        prepare_tokio_command(&input.command, &cwd, &sandbox_status, &sandbox_config, true);
 
     let output_result = if let Some(timeout_ms) = input.timeout {
         if let Ok(result) = timeout(Duration::from_millis(timeout_ms), command.output()).await {
@@ -278,7 +291,10 @@ fn test_timeout_provenance(
     })
 }
 
-fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> SandboxStatus {
+fn sandbox_status_for_input(
+    input: &BashCommandInput,
+    cwd: &std::path::Path,
+) -> (SandboxStatus, SandboxConfig) {
     let config = ConfigLoader::default_for(cwd).load().map_or_else(
         |_| SandboxConfig::default(),
         |runtime_config| runtime_config.sandbox().clone(),
@@ -290,17 +306,19 @@ fn sandbox_status_for_input(input: &BashCommandInput, cwd: &std::path::Path) -> 
         input.filesystem_mode,
         input.allowed_mounts.clone(),
     );
-    resolve_sandbox_status_for_request(&request, cwd)
+    let status = resolve_sandbox_status_for_request(&request, cwd);
+    (status, config)
 }
 
 fn prepare_command(
     command: &str,
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
+    sandbox_config: &SandboxConfig,
     create_dirs: bool,
 ) -> Command {
     if create_dirs {
-        prepare_sandbox_dirs(cwd);
+        prepare_sandbox_dirs(cwd, sandbox_config);
     }
 
     if let Some(launcher) = build_linux_sandbox_command(command, cwd, sandbox_status) {
@@ -314,8 +332,8 @@ fn prepare_command(
     let mut prepared = Command::new("sh");
     prepared.arg("-lc").arg(command).current_dir(cwd);
     if sandbox_status.filesystem_active {
-        prepared.env("HOME", cwd.join(".sandbox-home"));
-        prepared.env("TMPDIR", cwd.join(".sandbox-tmp"));
+        prepared.env("HOME", sandbox_config.get_sandbox_home(cwd).as_path());
+        prepared.env("TMPDIR", sandbox_config.get_sandbox_tmp(cwd).as_path());
     }
     prepared
 }
@@ -324,10 +342,11 @@ fn prepare_tokio_command(
     command: &str,
     cwd: &std::path::Path,
     sandbox_status: &SandboxStatus,
+    sandbox_config: &SandboxConfig,
     create_dirs: bool,
 ) -> TokioCommand {
     if create_dirs {
-        prepare_sandbox_dirs(cwd);
+        prepare_sandbox_dirs(cwd, sandbox_config);
     }
 
     let mut prepared =
@@ -340,8 +359,8 @@ fn prepare_tokio_command(
             let mut cmd = TokioCommand::new("sh");
             cmd.arg("-lc").arg(command);
             if sandbox_status.filesystem_active {
-                cmd.env("HOME", cwd.join(".sandbox-home"));
-                cmd.env("TMPDIR", cwd.join(".sandbox-tmp"));
+                cmd.env("HOME", sandbox_config.get_sandbox_home(cwd).as_path());
+                cmd.env("TMPDIR", sandbox_config.get_sandbox_tmp(cwd).as_path());
             }
             cmd
         };
@@ -352,9 +371,9 @@ fn prepare_tokio_command(
     prepared
 }
 
-fn prepare_sandbox_dirs(cwd: &std::path::Path) {
-    let _ = std::fs::create_dir_all(cwd.join(".sandbox-home"));
-    let _ = std::fs::create_dir_all(cwd.join(".sandbox-tmp"));
+fn prepare_sandbox_dirs(cwd: &std::path::Path, sandbox_config: &SandboxConfig) {
+    let _ = std::fs::create_dir_all(sandbox_config.get_sandbox_home(cwd).as_path());
+    let _ = std::fs::create_dir_all(sandbox_config.get_sandbox_tmp(cwd).as_path());
 }
 
 #[cfg(test)]

@@ -31,6 +31,12 @@ pub struct SandboxConfig {
     pub network_isolation: Option<bool>,
     pub filesystem_mode: Option<FilesystemIsolationMode>,
     pub allowed_mounts: Vec<String>,
+    /// Custom path for sandbox home directory. If not set, defaults to ".sandbox-home" in cwd.
+    #[serde(rename = "sandboxHome")]
+    pub sandbox_home: Option<String>,
+    /// Custom path for sandbox temp directory. If not set, defaults to ".sandbox-tmp" in cwd.
+    #[serde(rename = "sandboxTmp")]
+    pub sandbox_tmp: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
@@ -101,6 +107,38 @@ impl SandboxConfig {
                 .or(self.filesystem_mode)
                 .unwrap_or_default(),
             allowed_mounts: allowed_mounts_override.unwrap_or_else(|| self.allowed_mounts.clone()),
+        }
+    }
+
+    /// Get the resolved sandbox home directory path.
+    /// If `sandbox_home` is configured, use that; otherwise use ".sandbox-home" in cwd.
+    #[must_use]
+    pub fn get_sandbox_home(&self, cwd: &Path) -> PathBuf {
+        if let Some(ref custom) = self.sandbox_home {
+            let path = PathBuf::from(custom);
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        } else {
+            cwd.join(".sandbox-home")
+        }
+    }
+
+    /// Get the resolved sandbox temp directory path.
+    /// If `sandbox_tmp` is configured, use that; otherwise use ".sandbox-tmp" in cwd.
+    #[must_use]
+    pub fn get_sandbox_tmp(&self, cwd: &Path) -> PathBuf {
+        if let Some(ref custom) = self.sandbox_tmp {
+            let path = PathBuf::from(custom);
+            if path.is_absolute() {
+                path
+            } else {
+                cwd.join(path)
+            }
+        } else {
+            cwd.join(".sandbox-tmp")
         }
     }
 }
